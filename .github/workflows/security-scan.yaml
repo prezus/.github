@@ -22,6 +22,11 @@ on:
         description: 'The runner to use for jobs'
         type: string
         default: 'arc-runner-security-scanner'
+      image-ref:
+        description: 'Docker image to scan (overrides Dockerfile build). Tag defaults to :latest if not specified'
+        type: string
+        required: false
+        default: ''
 permissions:
   contents: read
   security-events: write
@@ -33,6 +38,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     outputs:
       rust: ${{ steps.detect.outputs.rust }}
+      rust-esp: ${{ steps.detect.outputs.rust-esp }}
       node: ${{ steps.detect.outputs.node }}
       go: ${{ steps.detect.outputs.go }}
       python: ${{ steps.detect.outputs.python }}
@@ -48,33 +54,19 @@ jobs:
           echo "go=$([[ -f go.mod ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "python=$([[ -f requirements.txt || -f pyproject.toml || -f Pipfile ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "dockerfile=$([[ -f Dockerfile ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-  trivy-scan:
-    name: Trivy Filesystem Scan
-    runs-on: ${{ inputs.runner }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-fs-results.sarif'
-          severity: ${{ inputs.severity-threshold }},CRITICAL
-          exit-code: ${{ inputs.fail-on-vulns && '1' || '0' }}
-      - name: Upload Trivy SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-fs-results.sarif'
-          category: 'trivy-filesystem'
-      - name: Upload Trivy results artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: trivy-fs-results
-          path: trivy-fs-results.sarif
+          
+          # ESP Rust detection
+          ESP_RUST=false
+          if [[ -f Cargo.toml ]]; then
+            if [[ -f .cargo/config.toml ]] && grep -qE "(xtensa|riscv32.*esp)" .cargo/config.toml 2>/dev/null; then
+              ESP_RUST=true
+            elif [[ -f rust-toolchain.toml ]] && grep -q "esp" rust-toolchain.toml 2>/dev/null; then
+              ESP_RUST=true
+            elif grep -qE "(esp-idf|esp-hal)" Cargo.toml 2>/dev/null; then
+              ESP_RUST=true
+            fi
+          fi
+          echo "rust-esp=$ESP_RUST" >> $GITHUB_OUTPUT
   gitleaks:
     name: Secret Detection (Gitleaks)
     runs-on: ${{ inputs.runner }}
@@ -92,25 +84,62 @@ jobs:
     name: Rust Security Audit
     runs-on: ${{ inputs.runner }}
     needs: detect-languages
-    if: needs.detect-languages.outputs.rust == 'true'
+    if: needs.detect-languages.outputs.rust == 'true' && needs.detect-languages.outputs.rust-esp != 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run cargo-audit
-        run: |
-          cargo audit --json > cargo-audit-results.json || true
-          cargo audit 2>&1 | tee cargo-audit-results.txt || true
+      - name: Run Trivy Rust scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'rust-audit-results.sarif'
+          severity: ${{ inputs.severity-threshold }},CRITICAL
+          exit-code: ${{ inputs.fail-on-vulns && '1' || '0' }}
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'rust-audit-results.sarif'
+          category: 'rust-security-audit'
       - name: Upload audit results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: cargo-audit-results
-          path: |
-            cargo-audit-results.json
-            cargo-audit-results.txt
+          name: rust-audit-results
+          path: rust-audit-results.sarif
+  rust-esp-audit:
+    name: Rust ESP Security Audit
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: espressif/idf-rust:latest
+    needs: detect-languages
+    if: needs.detect-languages.outputs.rust-esp == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run Trivy Rust ESP scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'rust-audit-results.sarif'
+          severity: ${{ inputs.severity-threshold }},CRITICAL
+          exit-code: ${{ inputs.fail-on-vulns && '1' || '0' }}
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'rust-audit-results.sarif'
+          category: 'rust-esp-security-audit'
+      - name: Upload audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-audit-results
+          path: rust-audit-results.sarif
   node-audit:
     name: Node.js Security Audit
     runs-on: ${{ inputs.runner }}
@@ -217,16 +246,31 @@ jobs:
     name: Docker Image Scan
     runs-on: ${{ inputs.runner }}
     needs: detect-languages
-    if: needs.detect-languages.outputs.dockerfile == 'true'
+    if: needs.detect-languages.outputs.dockerfile == 'true' || inputs.image-ref != ''
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Build image for scanning
-        run: docker build -t ${{ github.repository }}:scan .
+        if: inputs.image-ref == ''
+      - name: Pull or build image
+        id: image
+        run: |
+          if [[ -n "${{ inputs.image-ref }}" ]]; then
+            REF="${{ inputs.image-ref }}"
+            # Add :latest if no tag specified
+            if [[ "$REF" != *":"* ]]; then
+              REF="${REF}:latest"
+            fi
+            echo "ref=$REF" >> $GITHUB_OUTPUT
+            # Pull image (uses cache if unchanged)
+            docker pull "$REF"
+          else
+            echo "ref=${{ github.repository }}:scan" >> $GITHUB_OUTPUT
+            docker build -t ${{ github.repository }}:scan .
+          fi
       - name: Run Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: '${{ github.repository }}:scan'
+          image-ref: '${{ steps.image.outputs.ref }}'
           format: 'sarif'
           output: 'trivy-image-results.sarif'
           severity: ${{ inputs.severity-threshold }},CRITICAL
@@ -239,7 +283,7 @@ jobs:
   create-issue:
     name: Create Issue for Vulnerabilities
     runs-on: ${{ inputs.runner }}
-    needs: [trivy-scan, gitleaks, rust-audit, node-audit, go-audit, python-audit, docker-scan]
+    needs: [gitleaks, rust-audit, rust-esp-audit, node-audit, go-audit, python-audit, docker-scan]
     if: always() && inputs.create-issues
     steps:
       - name: Download all artifacts
@@ -263,18 +307,18 @@ jobs:
               return;
             }
             
-            // Parse Trivy results
-            const trivyPath = path.join(resultsDir, 'trivy-fs-results', 'trivy-fs-results.sarif');
-            if (fs.existsSync(trivyPath)) {
+            // Check Rust audit results (SARIF from Trivy)
+            const rustPath = path.join(resultsDir, 'rust-audit-results', 'rust-audit-results.sarif');
+            if (fs.existsSync(rustPath)) {
               try {
-                const trivy = JSON.parse(fs.readFileSync(trivyPath, 'utf8'));
-                const runs = trivy.runs || [];
+                const rust = JSON.parse(fs.readFileSync(rustPath, 'utf8'));
+                const runs = rust.runs || [];
                 for (const run of runs) {
                   const results = run.results || [];
                   for (const result of results) {
                     if (result.level === 'error' || result.level === 'warning') {
                       vulnerabilities.push({
-                        tool: 'Trivy',
+                        tool: 'Trivy (Rust)',
                         id: result.ruleId,
                         message: result.message?.text || 'Unknown vulnerability',
                         severity: result.level === 'error' ? 'HIGH/CRITICAL' : 'MEDIUM'
@@ -283,21 +327,7 @@ jobs:
                   }
                 }
               } catch (e) {
-                console.log('Error parsing Trivy results:', e.message);
-              }
-            }
-            
-            // Check cargo-audit results
-            const cargoPath = path.join(resultsDir, 'cargo-audit-results', 'cargo-audit-results.txt');
-            if (fs.existsSync(cargoPath)) {
-              const content = fs.readFileSync(cargoPath, 'utf8');
-              if (content.includes('Crate:') && content.includes('Version:')) {
-                vulnerabilities.push({
-                  tool: 'cargo-audit',
-                  id: 'RUSTSEC',
-                  message: 'Rust dependency vulnerabilities detected',
-                  severity: 'See cargo-audit-results artifact'
-                });
+                console.log('Error parsing Rust audit results:', e.message);
               }
             }
             
@@ -405,7 +435,7 @@ jobs:
   pr-comment:
     name: Comment on PR
     runs-on: ${{ inputs.runner }}
-    needs: [trivy-scan, gitleaks, rust-audit, node-audit, go-audit, python-audit, docker-scan]
+    needs: [gitleaks, rust-audit, rust-esp-audit, node-audit, go-audit, python-audit, docker-scan]
     if: always() && github.event_name == 'pull_request'
     steps:
       - name: Download all artifacts
@@ -425,8 +455,7 @@ jobs:
             
             // Check each scan result
             const checks = [
-              { name: 'Trivy Filesystem', artifact: 'trivy-fs-results', file: 'trivy-fs-results.sarif' },
-              { name: 'Cargo Audit', artifact: 'cargo-audit-results', file: 'cargo-audit-results.txt' },
+              { name: 'Rust Audit', artifact: 'rust-audit-results', file: 'rust-audit-results.sarif' },
               { name: 'Node Audit', artifact: 'node-audit-results', file: 'npm-audit-results.txt' },
               { name: 'Go Vulncheck', artifact: 'go-audit-results', file: 'govulncheck-results.txt' },
               { name: 'Pip Audit', artifact: 'python-audit-results', file: 'pip-audit-results.txt' }
@@ -486,7 +515,7 @@ jobs:
   discord-notify:
     name: Discord Notification
     runs-on: ${{ inputs.runner }}
-    needs: [trivy-scan, gitleaks, rust-audit, node-audit, go-audit, python-audit, docker-scan]
+    needs: [gitleaks, rust-audit, rust-esp-audit, node-audit, go-audit, python-audit, docker-scan]
     if: always() && inputs.notify-discord
     steps:
       - name: Download all artifacts
@@ -507,20 +536,12 @@ jobs:
           VULNS_FOUND=false
           VULN_SUMMARY=""
           
-          # Check Trivy results
-          if [[ -f scan-results/trivy-fs-results/trivy-fs-results.sarif ]]; then
-            TRIVY_ISSUES=$(jq -r '[.runs[].results[] | select(.level == "error" or .level == "warning")] | length' scan-results/trivy-fs-results/trivy-fs-results.sarif 2>/dev/null || echo "0")
-            if [[ "$TRIVY_ISSUES" -gt 0 ]]; then
+          # Check Rust audit results (SARIF)
+          if [[ -f scan-results/rust-audit-results/rust-audit-results.sarif ]]; then
+            RUST_ISSUES=$(jq -r '[.runs[].results[] | select(.level == "error" or .level == "warning")] | length' scan-results/rust-audit-results/rust-audit-results.sarif 2>/dev/null || echo "0")
+            if [[ "$RUST_ISSUES" -gt 0 ]]; then
               VULNS_FOUND=true
-              VULN_SUMMARY="${VULN_SUMMARY}Trivy: ${TRIVY_ISSUES} issues\n"
-            fi
-          fi
-          
-          # Check cargo-audit results
-          if [[ -f scan-results/cargo-audit-results/cargo-audit-results.txt ]]; then
-            if grep -q "Crate:" scan-results/cargo-audit-results/cargo-audit-results.txt 2>/dev/null; then
-              VULNS_FOUND=true
-              VULN_SUMMARY="${VULN_SUMMARY}Rust: vulnerabilities detected\n"
+              VULN_SUMMARY="${VULN_SUMMARY}Rust: ${RUST_ISSUES} issues\n"
             fi
           fi
           
