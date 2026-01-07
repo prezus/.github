@@ -14,6 +14,10 @@ on:
         description: 'Fail the workflow if vulnerabilities are found'
         type: boolean
         default: false
+      notify-discord:
+        description: 'Send Discord notification when vulnerabilities are found'
+        type: boolean
+        default: true
 permissions:
   contents: read
   security-events: write
@@ -544,3 +548,134 @@ jobs:
                 body: body
               });
             }
+  discord-notify:
+    name: Discord Notification
+    runs-on: arc-runner-security-scanner
+    needs: [trivy-scan, gitleaks, rust-audit, node-audit, go-audit, python-audit, dotnet-audit, java-maven-audit, docker-scan]
+    if: always() && inputs.notify-discord
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+        continue-on-error: true
+      - name: Check for vulnerabilities and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_GITHUB_WEBHOOK }}
+        run: |
+          # Skip if webhook is not configured
+          if [[ -z "$DISCORD_WEBHOOK" ]]; then
+            echo "Discord webhook not configured, skipping notification"
+            exit 0
+          fi
+          
+          VULNS_FOUND=false
+          VULN_SUMMARY=""
+          
+          # Check Trivy results
+          if [[ -f scan-results/trivy-fs-results/trivy-fs-results.sarif ]]; then
+            TRIVY_ISSUES=$(jq -r '[.runs[].results[] | select(.level == "error" or .level == "warning")] | length' scan-results/trivy-fs-results/trivy-fs-results.sarif 2>/dev/null || echo "0")
+            if [[ "$TRIVY_ISSUES" -gt 0 ]]; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}Trivy: ${TRIVY_ISSUES} issues\n"
+            fi
+          fi
+          
+          # Check cargo-audit results
+          if [[ -f scan-results/cargo-audit-results/cargo-audit-results.txt ]]; then
+            if grep -q "Crate:" scan-results/cargo-audit-results/cargo-audit-results.txt 2>/dev/null; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}Rust: vulnerabilities detected\n"
+            fi
+          fi
+          
+          # Check npm audit results
+          if [[ -f scan-results/node-audit-results/npm-audit-results.txt ]]; then
+            if grep -qiE "(high|critical|moderate)" scan-results/node-audit-results/npm-audit-results.txt 2>/dev/null; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}Node.js: vulnerabilities detected\n"
+            fi
+          fi
+          
+          # Check govulncheck results
+          if [[ -f scan-results/go-audit-results/govulncheck-results.txt ]]; then
+            if grep -qE "(Vulnerability|GO-)" scan-results/go-audit-results/govulncheck-results.txt 2>/dev/null; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}Go: vulnerabilities detected\n"
+            fi
+          fi
+          
+          # Check pip-audit results
+          if [[ -f scan-results/python-audit-results/pip-audit-results.txt ]]; then
+            if grep -qE "(PYSEC-|found)" scan-results/python-audit-results/pip-audit-results.txt 2>/dev/null; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}Python: vulnerabilities detected\n"
+            fi
+          fi
+          
+          # Check dotnet results
+          if [[ -f scan-results/dotnet-audit-results/dotnet-audit-results.txt ]]; then
+            if grep -q "has the following vulnerable packages" scan-results/dotnet-audit-results/dotnet-audit-results.txt 2>/dev/null; then
+              VULNS_FOUND=true
+              VULN_SUMMARY="${VULN_SUMMARY}.NET: vulnerabilities detected\n"
+            fi
+          fi
+          
+          # Only send notification if vulnerabilities were found
+          if [[ "$VULNS_FOUND" != "true" ]]; then
+            echo "No vulnerabilities found, skipping Discord notification"
+            exit 0
+          fi
+          
+          # Build Discord embed payload
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+          COMMIT="${{ github.sha }}"
+          SHORT_COMMIT="${COMMIT:0:7}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SECURITY_URL="${{ github.server_url }}/${{ github.repository }}/security"
+          
+          # Escape newlines for JSON
+          VULN_SUMMARY_ESCAPED=$(echo -e "$VULN_SUMMARY" | sed 's/$/\\n/' | tr -d '\n' | sed 's/\\n$//')
+          
+          PAYLOAD=$(cat <<EOF
+          {
+            "embeds": [{
+              "title": "Security Vulnerabilities Detected",
+              "color": 15158332,
+              "fields": [
+                {
+                  "name": "Repository",
+                  "value": "${REPO}",
+                  "inline": true
+                },
+                {
+                  "name": "Branch",
+                  "value": "${BRANCH}",
+                  "inline": true
+                },
+                {
+                  "name": "Commit",
+                  "value": "${SHORT_COMMIT}",
+                  "inline": true
+                },
+                {
+                  "name": "Findings",
+                  "value": "${VULN_SUMMARY_ESCAPED}",
+                  "inline": false
+                },
+                {
+                  "name": "Links",
+                  "value": "[Workflow Run](${RUN_URL}) | [Security Tab](${SECURITY_URL})",
+                  "inline": false
+                }
+              ],
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            }]
+          }
+          EOF
+          )
+          
+          # Send to Discord
+          curl -s -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK"
+          echo "Discord notification sent"
